@@ -4,6 +4,8 @@ import joblib
 import numpy as np
 import sqlite3
 from datetime import datetime
+from datetime import datetime
+import pytz
 
 app = FastAPI(title="Thermal Failure Prediction API")
 
@@ -74,7 +76,9 @@ def predict(sensor_data: dict):
         failure_probability = None
 
     # ---- Timestamp ----
-    timestamp = datetime.utcnow().isoformat()
+    sg_tz = pytz.timezone("Asia/Singapore")
+    now = datetime.now(sg_tz)
+    timestamp = now.strftime("%d-%m-%Y, %H:%M:%S")
 
     # ---- Save to SQLite ----
     cursor.execute("""
