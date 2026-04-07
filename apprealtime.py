@@ -5,6 +5,7 @@ import numpy as np
 import sqlite3
 from datetime import datetime
 import pytz
+import random
 
 app = FastAPI(title="Thermal Failure Prediction API")
 
@@ -37,20 +38,17 @@ CREATE TABLE IF NOT EXISTS sensor_data (
     temp REAL,
     change REAL,
     prediction INTEGER,
-    probability REAL,
-    is_demo INTEGER DEFAULT 0
+    probability REAL
 )
 """)
 conn.commit()
 
 # -----------------------------
-# Demo video mode: scripted temperature path
+# Config for demo temperature drift
 # -----------------------------
-DEMO_TEMPS = [
-    24.02, 24.08, 24.14, 24.20, 24.27, 24.35, 24.44, 24.56,
-    24.71, 24.90, 25.62, 26.31, 29.12, 30.48, 31.33, 36.78, 43.94, 45.90, 46.02,46.08
-]
-demo_step_index = 0
+MIN_TEMP = 23.8
+MAX_TEMP = 25.2
+MAX_STEP = 0.12   # max change per refresh, adjust if you want slower/faster drift
 
 # -----------------------------
 # Helper: current SG timestamp
@@ -61,22 +59,21 @@ def get_sg_timestamp():
     return now.strftime("%d-%m-%Y, %H:%M:%S")
 
 # -----------------------------
-# Helper: get previous temp
+# Helper: get previous saved row
 # -----------------------------
-def get_previous_temp():
+def get_previous_row():
     cursor.execute("""
-    SELECT temp
+    SELECT temp, change, prediction, probability, timestamp
     FROM sensor_data
     ORDER BY id DESC
     LIMIT 1
     """)
-    row = cursor.fetchone()
-    return float(row[0]) if row else None
+    return cursor.fetchone()
 
 # -----------------------------
 # Helper: run model + save row
 # -----------------------------
-def run_prediction_and_save(temp: float, change: float, is_demo: int = 0):
+def run_prediction_and_save(temp: float, change: float):
     X = np.array([[temp, change]])
 
     prediction = int(model.predict(X)[0])
@@ -85,14 +82,14 @@ def run_prediction_and_save(temp: float, change: float, is_demo: int = 0):
         proba = model.predict_proba(X)[0]
         failure_probability = float(proba[1])
     else:
-        failure_probability = 0.0  # default 0 if not supported
+        failure_probability = None
 
     timestamp = get_sg_timestamp()
 
     cursor.execute("""
-    INSERT INTO sensor_data (timestamp, temp, change, prediction, probability, is_demo)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """, (timestamp, temp, change, prediction, failure_probability, is_demo))
+    INSERT INTO sensor_data (timestamp, temp, change, prediction, probability)
+    VALUES (?, ?, ?, ?, ?)
+    """, (timestamp, temp, change, prediction, failure_probability))
     conn.commit()
 
     return {
@@ -104,22 +101,30 @@ def run_prediction_and_save(temp: float, change: float, is_demo: int = 0):
     }
 
 # -----------------------------
-# Helper: scripted demo record
+# Helper: generate drifting temp
 # -----------------------------
-def generate_scripted_record():
-    global demo_step_index
+def generate_drifting_record():
+    prev_row = get_previous_row()
 
-    prev_temp = get_previous_temp()
-
-    if demo_step_index < len(DEMO_TEMPS):
-        temp = DEMO_TEMPS[demo_step_index]
-        demo_step_index += 1
+    if prev_row is None:
+        # Start somewhere safely inside the range
+        temp = round(random.uniform(24.2, 24.8), 2)
+        change = 0.00
     else:
-        temp = 31.33
+        prev_temp = float(prev_row[0])
 
-    change = 0.0 if prev_temp is None else round(temp - prev_temp, 2)
+        # Small drift step, positive or negative
+        step = round(random.uniform(-MAX_STEP, MAX_STEP), 2)
+        new_temp = prev_temp + step
 
-    return run_prediction_and_save(temp, change, is_demo=1)  # mark as demo
+        # Clamp to min/max range
+        new_temp = max(MIN_TEMP, min(MAX_TEMP, new_temp))
+        new_temp = round(new_temp, 2)
+
+        change = round(new_temp - prev_temp, 2)
+        temp = new_temp
+
+    return run_prediction_and_save(temp, change)
 
 # -----------------------------
 # Health check
@@ -139,59 +144,61 @@ def predict(sensor_data: dict):
     temp = round(float(sensor_data["Temp_Sensor_1"]), 2)
     change = round(float(sensor_data["Temp_Sensor_1_Change"]), 2)
 
-    return run_prediction_and_save(temp, change, is_demo=0)  # real sensor input
+    return run_prediction_and_save(temp, change)
 
 # -----------------------------
-# Latest data endpoint (scripted demo mode)
+# Latest data endpoint (demo mode)
+# Generates a fresh drifting reading each time
 # -----------------------------
 @app.get("/latest")
 def get_latest():
-    return generate_scripted_record()
+    return generate_drifting_record()
 
 # -----------------------------
-# Reset demo sequence
-# -----------------------------
-@app.post("/reset-demo")
-def reset_demo():
-    global demo_step_index
-    demo_step_index = 0
-
-    cursor.execute("DELETE FROM sensor_data WHERE is_demo=1")  # delete demo only
-    conn.commit()
-
-    return {"message": "Demo sequence reset successfully"}
-
-# -----------------------------
-# Get full history (real data only)
+# Get full history
 # -----------------------------
 @app.get("/history")
-def get_history(limit: int = None):
-    if limit:
-        cursor.execute("""
-        SELECT timestamp, temp, change, prediction, probability
-        FROM sensor_data
-        WHERE is_demo=0
-        ORDER BY id DESC
-        LIMIT ?
-        """, (limit,))
-    else:
-        cursor.execute("""
-        SELECT timestamp, temp, change, prediction, probability
-        FROM sensor_data
-        WHERE is_demo=0
-        ORDER BY id DESC
-        """)
-
+def get_history():
+    cursor.execute("""
+    SELECT timestamp, temp, change, prediction, probability
+    FROM sensor_data
+    ORDER BY id DESC
+    """)
     rows = cursor.fetchall()
 
     data = []
     for row in rows:
         data.append({
             "timestamp": row[0],
-            "Temp_Sensor_1": f"{float(row[1]):.2f}",
-            "Temp_Sensor_1_Change": f"{float(row[2]):.2f}",
+            "Temp_Sensor_1": f"{row[1]:.2f}",
+            "Temp_Sensor_1_Change": f"{row[2]:.2f}",
             "prediction": row[3],
-            "probability": float(row[4]) if row[4] is not None else 0.0
+            "probability": row[4]
+        })
+
+    return data
+
+# -----------------------------
+# Optional: limit history
+# -----------------------------
+@app.get("/history/{limit}")
+def get_limited_history(limit: int):
+    cursor.execute("""
+    SELECT timestamp, temp, change, prediction, probability
+    FROM sensor_data
+    ORDER BY id DESC
+    LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+
+    data = []
+    for row in rows:
+        data.append({
+            "timestamp": row[0],
+            "Temp_Sensor_1": f"{row[1]:.2f}",
+            "Temp_Sensor_1_Change": f"{row[2]:.2f}",
+            "prediction": row[3],
+            "probability": row[4]
         })
 
     return data
