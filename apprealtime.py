@@ -202,3 +202,4 @@ def get_limited_history(limit: int):
         })
 
     return data
+    
