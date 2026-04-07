@@ -5,7 +5,6 @@ import numpy as np
 import sqlite3
 from datetime import datetime
 import pytz
-import random
 
 app = FastAPI(title="Thermal Failure Prediction API")
 
@@ -44,11 +43,15 @@ CREATE TABLE IF NOT EXISTS sensor_data (
 conn.commit()
 
 # -----------------------------
-# Config for demo temperature drift
+# Demo video mode: scripted temperature path
 # -----------------------------
-MIN_TEMP = 23.8
-MAX_TEMP = 25.2
-MAX_STEP = 0.12   # max change per refresh, adjust if you want slower/faster drift
+DEMO_TEMPS = [
+    24.02, 24.08, 24.14, 24.20, 24.27, 24.35, 24.44, 24.56,
+    24.71, 24.90, 25.18, 25.62, 26.31, 27.45, 29.12, 30.48,
+    31.33
+]
+
+demo_step_index = 0
 
 # -----------------------------
 # Helper: current SG timestamp
@@ -59,16 +62,17 @@ def get_sg_timestamp():
     return now.strftime("%d-%m-%Y, %H:%M:%S")
 
 # -----------------------------
-# Helper: get previous saved row
+# Helper: get previous temp
 # -----------------------------
-def get_previous_row():
+def get_previous_temp():
     cursor.execute("""
-    SELECT temp, change, prediction, probability, timestamp
+    SELECT temp
     FROM sensor_data
     ORDER BY id DESC
     LIMIT 1
     """)
-    return cursor.fetchone()
+    row = cursor.fetchone()
+    return float(row[0]) if row else None
 
 # -----------------------------
 # Helper: run model + save row
@@ -101,28 +105,23 @@ def run_prediction_and_save(temp: float, change: float):
     }
 
 # -----------------------------
-# Helper: generate drifting temp
+# Helper: scripted demo record
 # -----------------------------
-def generate_drifting_record():
-    prev_row = get_previous_row()
+def generate_scripted_record():
+    global demo_step_index
 
-    if prev_row is None:
-        # Start somewhere safely inside the range
-        temp = round(random.uniform(24.2, 24.8), 2)
+    prev_temp = get_previous_temp()
+
+    if demo_step_index < len(DEMO_TEMPS):
+        temp = DEMO_TEMPS[demo_step_index]
+        demo_step_index += 1
+    else:
+        temp = 31.33
+
+    if prev_temp is None:
         change = 0.00
     else:
-        prev_temp = float(prev_row[0])
-
-        # Small drift step, positive or negative
-        step = round(random.uniform(-MAX_STEP, MAX_STEP), 2)
-        new_temp = prev_temp + step
-
-        # Clamp to min/max range
-        new_temp = max(MIN_TEMP, min(MAX_TEMP, new_temp))
-        new_temp = round(new_temp, 2)
-
-        change = round(new_temp - prev_temp, 2)
-        temp = new_temp
+        change = round(temp - prev_temp, 2)
 
     return run_prediction_and_save(temp, change)
 
@@ -147,12 +146,24 @@ def predict(sensor_data: dict):
     return run_prediction_and_save(temp, change)
 
 # -----------------------------
-# Latest data endpoint (demo mode)
-# Generates a fresh drifting reading each time
+# Latest data endpoint (scripted demo mode)
 # -----------------------------
 @app.get("/latest")
 def get_latest():
-    return generate_drifting_record()
+    return generate_scripted_record()
+
+# -----------------------------
+# Reset demo sequence
+# -----------------------------
+@app.post("/reset-demo")
+def reset_demo():
+    global demo_step_index
+    demo_step_index = 0
+
+    cursor.execute("DELETE FROM sensor_data")
+    conn.commit()
+
+    return {"message": "Demo sequence reset successfully"}
 
 # -----------------------------
 # Get full history
