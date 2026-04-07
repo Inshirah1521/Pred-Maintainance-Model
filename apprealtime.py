@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS sensor_data (
     temp REAL,
     change REAL,
     prediction INTEGER,
-    probability REAL
+    probability REAL,
+    is_demo INTEGER DEFAULT 0
 )
 """)
 conn.commit()
@@ -50,7 +51,6 @@ DEMO_TEMPS = [
     24.71, 24.90, 25.18, 25.62, 26.31, 27.45, 29.12, 30.48,
     31.33
 ]
-
 demo_step_index = 0
 
 # -----------------------------
@@ -77,7 +77,7 @@ def get_previous_temp():
 # -----------------------------
 # Helper: run model + save row
 # -----------------------------
-def run_prediction_and_save(temp: float, change: float):
+def run_prediction_and_save(temp: float, change: float, is_demo: int = 0):
     X = np.array([[temp, change]])
 
     prediction = int(model.predict(X)[0])
@@ -86,14 +86,14 @@ def run_prediction_and_save(temp: float, change: float):
         proba = model.predict_proba(X)[0]
         failure_probability = float(proba[1])
     else:
-        failure_probability = None
+        failure_probability = 0.0  # default 0 if not supported
 
     timestamp = get_sg_timestamp()
 
     cursor.execute("""
-    INSERT INTO sensor_data (timestamp, temp, change, prediction, probability)
-    VALUES (?, ?, ?, ?, ?)
-    """, (timestamp, temp, change, prediction, failure_probability))
+    INSERT INTO sensor_data (timestamp, temp, change, prediction, probability, is_demo)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (timestamp, temp, change, prediction, failure_probability, is_demo))
     conn.commit()
 
     return {
@@ -118,12 +118,9 @@ def generate_scripted_record():
     else:
         temp = 31.33
 
-    if prev_temp is None:
-        change = 0.00
-    else:
-        change = round(temp - prev_temp, 2)
+    change = 0.0 if prev_temp is None else round(temp - prev_temp, 2)
 
-    return run_prediction_and_save(temp, change)
+    return run_prediction_and_save(temp, change, is_demo=1)  # mark as demo
 
 # -----------------------------
 # Health check
@@ -143,7 +140,7 @@ def predict(sensor_data: dict):
     temp = round(float(sensor_data["Temp_Sensor_1"]), 2)
     change = round(float(sensor_data["Temp_Sensor_1_Change"]), 2)
 
-    return run_prediction_and_save(temp, change)
+    return run_prediction_and_save(temp, change, is_demo=0)  # real sensor input
 
 # -----------------------------
 # Latest data endpoint (scripted demo mode)
@@ -160,56 +157,42 @@ def reset_demo():
     global demo_step_index
     demo_step_index = 0
 
-    cursor.execute("DELETE FROM sensor_data")
+    cursor.execute("DELETE FROM sensor_data WHERE is_demo=1")  # delete demo only
     conn.commit()
 
     return {"message": "Demo sequence reset successfully"}
 
 # -----------------------------
-# Get full history
+# Get full history (real data only)
 # -----------------------------
 @app.get("/history")
-def get_history():
-    cursor.execute("""
-    SELECT timestamp, temp, change, prediction, probability
-    FROM sensor_data
-    ORDER BY id DESC
-    """)
+def get_history(limit: int = None):
+    if limit:
+        cursor.execute("""
+        SELECT timestamp, temp, change, prediction, probability
+        FROM sensor_data
+        WHERE is_demo=0
+        ORDER BY id DESC
+        LIMIT ?
+        """, (limit,))
+    else:
+        cursor.execute("""
+        SELECT timestamp, temp, change, prediction, probability
+        FROM sensor_data
+        WHERE is_demo=0
+        ORDER BY id DESC
+        """)
+
     rows = cursor.fetchall()
 
     data = []
     for row in rows:
         data.append({
             "timestamp": row[0],
-            "Temp_Sensor_1": f"{row[1]:.2f}",
-            "Temp_Sensor_1_Change": f"{row[2]:.2f}",
+            "Temp_Sensor_1": f"{float(row[1]):.2f}",
+            "Temp_Sensor_1_Change": f"{float(row[2]):.2f}",
             "prediction": row[3],
-            "probability": row[4]
-        })
-
-    return data
-
-# -----------------------------
-# Optional: limit history
-# -----------------------------
-@app.get("/history/{limit}")
-def get_limited_history(limit: int):
-    cursor.execute("""
-    SELECT timestamp, temp, change, prediction, probability
-    FROM sensor_data
-    ORDER BY id DESC
-    LIMIT ?
-    """, (limit,))
-    rows = cursor.fetchall()
-
-    data = []
-    for row in rows:
-        data.append({
-            "timestamp": row[0],
-            "Temp_Sensor_1": f"{row[1]:.2f}",
-            "Temp_Sensor_1_Change": f"{row[2]:.2f}",
-            "prediction": row[3],
-            "probability": row[4]
+            "probability": float(row[4]) if row[4] is not None else 0.0
         })
 
     return data
